@@ -34,10 +34,20 @@ if (isset($_GET['action'])) {
         $input = json_decode(file_get_contents('php://input'), true);
         if ($input) {
             saveData($DATA_FILE, $input);
-            echo json_encode(['ok' => true]);
+            echo json_encode(['ok' => true, 'hash' => md5_file($DATA_FILE)]);
         } else {
             http_response_code(400);
             echo json_encode(['error' => 'Dados inválidos']);
+        }
+        exit;
+    }
+
+    // Lightweight check — returns only the hash of current data
+    if ($_GET['action'] === 'poll') {
+        if (file_exists($DATA_FILE)) {
+            echo json_encode(['hash' => md5_file($DATA_FILE)]);
+        } else {
+            echo json_encode(['hash' => '']);
         }
         exit;
     }
@@ -327,6 +337,20 @@ if (isset($_GET['action'])) {
   }
   .empty-state strong { color: var(--text2); }
 
+  /* === SYNC INDICATOR === */
+  .sync-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--text3); margin-left: 8px;
+    padding: 2px 8px; border-radius: 4px;
+    background: var(--surface2); border: 1px solid var(--border);
+  }
+  .sync-badge .pulse {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .sync-badge.offline .pulse { background: var(--red); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
   /* === RESPONSIVE === */
   @media (max-width: 768px) {
     .header { padding: 14px 16px; }
@@ -334,6 +358,7 @@ if (isset($_GET['action'])) {
     .container { padding: 16px; }
     .summary { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
     .summary-card .total { font-size: 16px; }
+    .sync-badge { display: none; }
   }
 </style>
 </head>
@@ -344,7 +369,10 @@ if (isset($_GET['action'])) {
     <div class="logo">T</div>
     <div>
       <h1>Tchurminha <span>racha conta</span></h1>
-      <div class="save-status"><span class="save-dot" id="saveDot"></span> <span id="saveText">Salvo</span></div>
+      <div class="save-status">
+        <span class="save-dot" id="saveDot"></span> <span id="saveText">Salvo</span>
+        <span class="sync-badge" id="syncBadge"><span class="pulse"></span> ao vivo</span>
+      </div>
     </div>
   </div>
   <div class="header-actions">
@@ -390,6 +418,9 @@ if (isset($_GET['action'])) {
 <script>
 let state = { people: [], items: [] };
 let saveTimeout = null;
+let lastHash = '';       // tracks the server data version
+let isSaving = false;    // prevents poll from overwriting during a save
+const POLL_INTERVAL = 3000;
 
 // === PERSISTENCE ===
 async function loadState() {
@@ -403,12 +434,17 @@ async function loadState() {
         if (item.checks.length > state.people.length) item.checks = item.checks.slice(0, state.people.length);
       });
     }
+    // Get initial hash
+    lastHash = await fetchHash();
+    setSyncOnline(true);
   } catch (e) {
     const local = localStorage.getItem('tchurminha');
     if (local) state = JSON.parse(local);
     else state = { people: ['David','Malu','Diego','Josi','PRT','Juni'], items: [] };
+    setSyncOnline(false);
   }
   render();
+  startPolling();
 }
 
 function scheduleSave() {
@@ -419,16 +455,71 @@ function scheduleSave() {
 }
 
 async function doSave() {
+  isSaving = true;
   localStorage.setItem('tchurminha', JSON.stringify(state));
   try {
-    await fetch('?action=save', {
+    const res = await fetch('?action=save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state)
     });
-  } catch (e) {}
+    const result = await res.json();
+    if (result.hash) lastHash = result.hash;
+    setSyncOnline(true);
+  } catch (e) {
+    setSyncOnline(false);
+  }
+  isSaving = false;
   document.getElementById('saveDot').classList.remove('pending');
   document.getElementById('saveText').textContent = 'Salvo';
+}
+
+// === REALTIME SYNC (polling) ===
+async function fetchHash() {
+  try {
+    const res = await fetch('?action=poll');
+    const data = await res.json();
+    return data.hash || '';
+  } catch (e) { return ''; }
+}
+
+function startPolling() {
+  setInterval(async () => {
+    if (isSaving) return; // don't poll while saving
+    try {
+      const hash = await fetchHash();
+      if (hash && hash !== lastHash) {
+        // Someone else changed the data — reload
+        lastHash = hash;
+        const res = await fetch('?action=load');
+        const data = await res.json();
+        if (data && data.people) {
+          state = data;
+          state.items.forEach(item => {
+            while (item.checks.length < state.people.length) item.checks.push(false);
+            if (item.checks.length > state.people.length) item.checks = item.checks.slice(0, state.people.length);
+          });
+          localStorage.setItem('tchurminha', JSON.stringify(state));
+          render();
+          toast('Atualizado por outro usuario');
+        }
+      }
+      setSyncOnline(true);
+    } catch (e) {
+      setSyncOnline(false);
+    }
+  }, POLL_INTERVAL);
+}
+
+function setSyncOnline(online) {
+  const badge = document.getElementById('syncBadge');
+  if (online) {
+    badge.classList.remove('offline');
+    badge.innerHTML = '<span class="pulse"></span> ao vivo';
+  } else {
+    badge.classList.add('offline');
+    badge.innerHTML = '<span class="pulse"></span> offline';
+  }
 }
 
 // === RENDER ===
